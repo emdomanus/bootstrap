@@ -1,0 +1,10 @@
+*.rbxm
+*.rbxmx
+*.rbxlx
+*.tar.gz
+sourcemap.json
+dev-sourcemap.json
+.pesde/
+roblox_packages/
+luau_packages/
+lune_packages/

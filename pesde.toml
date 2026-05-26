@@ -1,0 +1,21 @@
+name = "emdomanus/bootstrap"
+version = "0.1.0"
+description = "Small lifecycle bootstrap helpers for Roblox projects."
+license = "MIT"
+authors = ["emdomanus"]
+repository = "https://github.com/emdomanus/bootstrap"
+
+includes = [
+	"pesde.toml",
+	"LICENSE",
+	"README.md",
+	"src/**/*.luau",
+]
+
+[target]
+environment = "roblox"
+lib = "src/init.luau"
+build_files = ["src"]
+
+[indices]
+default = "https://github.com/pesde-pkg/index"
