@@ -1,6 +1,6 @@
 name = "emdomanus/bootstrap"
 version = "0.1.0"
-description = "Small lifecycle bootstrap helpers for Roblox projects."
+description = "Typed profile construction, wiring, startup, and owned teardown for Roblox applications."
 license = "MIT"
 authors = ["emdomanus"]
 repository = "https://github.com/emdomanus/bootstrap"

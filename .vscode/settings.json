@@ -1,0 +1,16 @@
+{
+  "files.associations": {
+    "*.luau": "luau"
+  },
+  "luau-lsp.platform.type": "roblox",
+  "luau-lsp.fflags.enableNewSolver": true,
+  "luau-lsp.sourcemap.enabled": true,
+  "luau-lsp.sourcemap.autogenerate": true,
+  "luau-lsp.sourcemap.rojoProjectFile": "verification.project.json",
+  "luau-lsp.sourcemap.sourcemapFile": "examples-sourcemap.json",
+  "luau-lsp.ignoreGlobs": [
+    "**/_Index/**",
+    "**/.verification/**",
+    "**/tests/typechecks/rejected.luau"
+  ]
+}

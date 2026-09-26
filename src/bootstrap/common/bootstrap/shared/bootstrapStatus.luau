@@ -1,0 +1,25 @@
+--!strict
+export type BootstrapStatus =
+	"idle"
+	| "constructing"
+	| "validating"
+	| "initializing"
+	| "wiring"
+	| "starting"
+	| "running"
+	| "deconstructing"
+	| "stopped"
+	| "failed"
+export type BootstrapPhase =
+	"idle"
+	| "construct"
+	| "validate"
+	| "init"
+	| "wire"
+	| "start"
+	| "deconstruct"
+	| "ready"
+	| "stopped"
+	| "failed"
+export type BootstrapOperationState = "pending" | "running" | "completed" | "failed"
+return {}

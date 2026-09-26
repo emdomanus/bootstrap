@@ -1,0 +1,12 @@
+{
+  "name": "bootstrap-verification",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "bootstrap": { "$path": "src" },
+      "examples": { "$path": "examples" },
+      "typechecks": { "$path": "tests/typechecks" }
+    }
+  }
+}
