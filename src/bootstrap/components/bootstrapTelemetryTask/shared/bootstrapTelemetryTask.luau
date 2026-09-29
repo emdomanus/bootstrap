@@ -1,4 +1,6 @@
 --!strict
+--!optimize 2
+--!native
 local TaskTypes =
 	require(script.Parent.Parent.Parent.Parent.types.components.bootstrapTelemetryTask.shared.bootstrapTelemetryTask)
 local ReaderTypes = require(

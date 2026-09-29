@@ -16,9 +16,21 @@ local BootstrapTelemetryTaskStateTypes =
 	require(script.bootstrap.common.bootstrapTelemetryTask.shared.bootstrapTelemetryTaskState)
 
 export type Bootstrap<G> = BootstrapTypes.Bootstrap<G>
-export type BootstrapOptions = BootstrapTypes.BootstrapOptions
-export type BootstrapProfile<C, G> = BootstrapProfileTypes.BootstrapProfile<C, G>
-export type BootstrapRegistration<C, G> = BootstrapProfileTypes.BootstrapRegistration<C, G>
+export type BootstrapOptions<StartPhase, StopPhase> = BootstrapTypes.BootstrapOptions<StartPhase, StopPhase>
+export type BootstrapProfile<C, G, StartPhase, StopPhase> = BootstrapProfileTypes.BootstrapProfile<
+	C,
+	G,
+	StartPhase,
+	StopPhase
+>
+export type BootstrapRegistration<C, G, StartPhase, StopPhase> = BootstrapProfileTypes.BootstrapRegistration<
+	C,
+	G,
+	StartPhase,
+	StopPhase
+>
+export type BootstrapCallbacks<C, P> = BootstrapProfileTypes.BootstrapCallbacks<C, P>
+export type BootstrapShutdown<C> = BootstrapProfileTypes.BootstrapShutdown<C>
 export type BootstrapTelemetryReader = BootstrapTelemetryReaderTypes.BootstrapTelemetryReader
 export type BootstrapTelemetryContext = BootstrapTelemetryContextTypes.BootstrapTelemetryContext
 export type BootstrapStatus = BootstrapStatusTypes.BootstrapStatus

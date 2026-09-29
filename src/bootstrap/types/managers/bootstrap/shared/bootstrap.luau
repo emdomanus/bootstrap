@@ -6,29 +6,36 @@ local BootstrapTelemetryTypes =
 local BootstrapTelemetryReaderTypes =
 	require(script.Parent.Parent.Parent.Parent.ports.components.bootstrapTelemetry.shared.bootstrapTelemetryReader)
 type BootstrapStatus = BootstrapStatusTypes.BootstrapStatus
-type BootstrapProfile<C, G> = BootstrapProfileTypes.BootstrapProfile<C, G>
+type BootstrapProfile<C, G, StartPhase, StopPhase> = BootstrapProfileTypes.BootstrapProfile<C, G, StartPhase, StopPhase>
 type BootstrapTelemetryOwned = BootstrapTelemetryTypes.BootstrapTelemetryOwned
 type BootstrapTelemetryReader = BootstrapTelemetryReaderTypes.BootstrapTelemetryReader
 
-export type BootstrapOptions = {
-	budgetSeconds: number?,
-	clock: (() -> number)?,
-	yieldExecution: (() -> ())?,
+export type BootstrapOptions<StartPhase, StopPhase> = {
+	read startPhases: { StartPhase },
+	read stopPhases: { StopPhase },
+	read budgetSeconds: number?,
+	read clock: (() -> number)?,
+	read yieldExecution: (() -> ())?,
 }
 export type Bootstrap<G> = {
-	start: (self: Bootstrap<G>) -> G,
-	getStatus: (self: Bootstrap<G>) -> BootstrapStatus,
-	getTelemetryReader: (self: Bootstrap<G>) -> BootstrapTelemetryReader,
-	deconstruct: (self: Bootstrap<G>) -> (),
+	read create: (self: Bootstrap<G>) -> G,
+	read destroy: (self: Bootstrap<G>) -> (),
+	read getStatus: (self: Bootstrap<G>) -> BootstrapStatus,
+	read getTelemetryReader: (self: Bootstrap<G>) -> BootstrapTelemetryReader,
 }
-export type BootstrapImpl<C, G> = Bootstrap<G> & {
-	_profile: BootstrapProfile<C, G>?,
+export type BootstrapImpl<C, G, StartPhase, StopPhase> = {
+	_profile: BootstrapProfile<C, G, StartPhase, StopPhase>?,
+	_startPhases: { StartPhase },
+	_stopPhases: { StopPhase },
 	_graphContext: C,
 	_status: BootstrapStatus,
-	_busy: boolean,
-	_entered: number,
+	_owner: thread?,
+	_destroyRequested: boolean,
+	_entered: { [number]: boolean },
+	_failure: string?,
 	_checkpoint: () -> (),
 	_resetBudget: () -> (),
+	_yieldExecution: () -> (),
 	_bootstrapTelemetry: BootstrapTelemetryOwned,
 }
 return {}

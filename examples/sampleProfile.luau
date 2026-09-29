@@ -5,7 +5,9 @@ type SampleGraphContext = SampleProfileTypes.SampleGraphContext
 type SampleGraph = SampleProfileTypes.SampleGraph
 type SampleOptions = SampleProfileTypes.SampleOptions
 type BootstrapTelemetryContext = Bootstrap.BootstrapTelemetryContext
-type BootstrapProfile = Bootstrap.BootstrapProfile<SampleGraphContext, SampleGraph>
+type SampleStartPhase = SampleProfileTypes.SampleStartPhase
+type SampleStopPhase = SampleProfileTypes.SampleStopPhase
+type BootstrapProfile = Bootstrap.BootstrapProfile<SampleGraphContext, SampleGraph, SampleStartPhase, SampleStopPhase>
 type SampleProfileModule = { new: (options: SampleOptions) -> BootstrapProfile }
 
 local function new(options: SampleOptions): BootstrapProfile
@@ -13,12 +15,14 @@ local function new(options: SampleOptions): BootstrapProfile
 		registrations = {
 			{
 				name = "Loading Display",
+				start = {},
 				construct = function(graphContext: SampleGraphContext, telemetryContext: BootstrapTelemetryContext): ()
 					local SampleLoadingDisplay = require(script.Parent.components.sample.shared.sampleLoadingDisplay)
 					graphContext.sampleLoadingDisplay =
 						SampleLoadingDisplay.new(telemetryContext:getReader(), options.display)
 				end,
-				deconstruct = function(graphContext: SampleGraphContext): ()
+				stop = {},
+				destroy = function(graphContext: SampleGraphContext): ()
 					local sampleLoadingDisplay = graphContext.sampleLoadingDisplay
 					graphContext.sampleLoadingDisplay = nil
 					if sampleLoadingDisplay then
@@ -28,6 +32,7 @@ local function new(options: SampleOptions): BootstrapProfile
 			},
 			{
 				name = "Counter",
+				start = {},
 				construct = function(graphContext: SampleGraphContext, telemetryContext: BootstrapTelemetryContext): ()
 					local task = telemetryContext:createTask("Prepare counter")
 					task:setStatus("Creating initial value")
@@ -36,7 +41,8 @@ local function new(options: SampleOptions): BootstrapProfile
 					task:setProgress(1, 1)
 					task:complete()
 				end,
-				deconstruct = function(graphContext: SampleGraphContext): ()
+				stop = {},
+				destroy = function(graphContext: SampleGraphContext): ()
 					local sampleCounter = graphContext.sampleCounter
 					graphContext.sampleCounter = nil
 					if sampleCounter then
@@ -50,13 +56,16 @@ local function new(options: SampleOptions): BootstrapProfile
 					local SampleReporter = require(script.Parent.components.sample.shared.sampleReporter)
 					graphContext.sampleReporter = SampleReporter.new(options.report)
 				end,
-				wire = function(graphContext: SampleGraph): ()
-					graphContext.sampleReporter:wire(graphContext.sampleCounter)
-				end,
-				start = function(graphContext: SampleGraph): ()
-					graphContext.sampleReporter:start()
-				end,
-				deconstruct = function(graphContext: SampleGraphContext): ()
+				start = {
+					["wire" :: SampleStartPhase] = function(graphContext: SampleGraph): ()
+						graphContext.sampleReporter:wire(graphContext.sampleCounter)
+					end,
+					["activate" :: SampleStartPhase] = function(graphContext: SampleGraph): ()
+						graphContext.sampleReporter:start()
+					end,
+				},
+				stop = {},
+				destroy = function(graphContext: SampleGraphContext): ()
 					local sampleReporter = graphContext.sampleReporter
 					graphContext.sampleReporter = nil
 					if sampleReporter then

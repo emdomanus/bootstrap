@@ -1,116 +1,184 @@
 # Bootstrap
 
-A typed lifecycle runner for ordered, named service registrations. Profiles choose what loads.
-Bootstrap runs phase barriers, budgets time between operations, reports progress, and releases
-entered registrations in reverse order.
+A typed lifecycle controller with four registration sections: construct, phased start, phased stop,
+and destroy. Profiles own composition; Bootstrap owns ordering, execution pacing, progress, and
+cleanup eligibility. The package entry is `src/init.luau`; `Bootstrap.new` is its only top-level
+runtime export.
 
 ## Entry and usage
 
-The package entry is `src/init.luau`, so the package root becomes a Roblox ModuleScript.
-`Bootstrap.new` is the only top-level runtime export.
-
 ```luau
-local graphContext: SampleGraphContext = {}
-local application = Bootstrap.new(SampleProfile.new(options), graphContext, {
+local application = Bootstrap.new(profile, graphContext, {
+    startPhases = { "init", "wire", "activate" },
+    stopPhases = { "quiesce", "persist" },
     budgetSeconds = 0.004,
 })
-local reader = application:getTelemetryReader()
-reader:bindToPhaseChanged(function(phase)
-    print(phase, reader:getName())
-end)
-local graph = application:start()
-graph.sampleCounter:increment()
-application:deconstruct()
+-- Register the host's shutdown hook here, before create can yield.
+-- The hook calls application:destroy(). Handle its reported error at the host boundary.
+local graph = application:create()
+-- Use the graph while application:getStatus() == "running".
+application:destroy()
 ```
 
-See the [executable profile](examples/sampleProfile.luau) and
-[typed host usage](tests/typechecks/accepted.luau). The example includes a loading-display
-collaborator; its display callback can drive a host-owned UI.
+Start and stop phase names are application choices, with distinct literal-union types. Annotate
+options/maps at their authoring boundary. See the [typed host usage](tests/typechecks/accepted.luau)
+and [executable profile](examples/sampleProfile.luau). The sample constructs its loading display
+first, so reverse final destruction keeps it alive until every other owner has been released.
 
 ## Registrations and typed graphs
 
-A profile contains an ordered `registrations` array and a `validate(graphContext) -> G` function.
-Each registration requires **`name`, `construct`, and `deconstruct`**.
-`init`, `wire`, and `start` are optional. Names are unique, nonblank human-readable labels.
-There is no field-name metadata. Callbacks assign fields directly, with normal Luau typechecking.
+`BootstrapProfile<C, G, StartPhase, StopPhase>` contains:
 
-| Callback | Graph received | Responsibility |
-| --- | --- | --- |
-| `construct(graphContext, telemetryContext)` | Construction graph `C` | Lazily require implementations, construct objects, assign their fields. |
-| `init(graphContext, telemetryContext)` | Complete graph `G` | Prepare owned resources. |
-| `wire(graphContext, telemetryContext)` | Complete graph `G` | Inject narrow capabilities into collaborators. |
-| `start(graphContext, telemetryContext)` | Complete graph `G` | Begin active behavior. |
-| `deconstruct(graphContext, telemetryContext)` | Original construction graph `C` | Release owned resources and clear fields, tolerating partial startup. |
+- `registrations`: an ordered array of named resource owners.
+- `validate(context: C) -> G`: runs once after every constructor succeeds and before any start
+  callback. It checks and returns the complete graph, without an unchecked cast.
+- `shutdown`: optional ordered `{ name, run(context: C, telemetryContext) }` callbacks installed
+  before creation. These always run on destruction, independently of registration entry.
 
-Construction fields are optional because the graph starts empty. After all constructors finish,
-`validate` asserts the required fields and returns the complete graph. That graph is passed unchanged
-to every later startup callback and returned from `start`. It can be a new table holding the same
-constructed objects; Bootstrap does not clone service instances. Deconstruction always receives
-the original construction graph, even if validation failed.
+Each registration requires a semantic `name` and four sections:
 
-A registration looks like this inside a typed profile:
+| Section | Shape | Callback context | Responsibility |
+| --- | --- | --- | --- |
+| `construct` | One required callback | Partial context `C` | Instantiate objects and assign graph fields. |
+| `start` | Map keyed by `StartPhase` | Validated graph `G` | Initialize, wire, and activate objects. |
+| `stop` | Map keyed by `StopPhase` | Original context `C` | Coordinate quiescence, persistence, and shutdown. |
+| `destroy` | One required callback | Original context `C` | Release owned resources after all stop attempts. |
+
+The two maps are required but may be empty. Their values are explicitly optional:
+`BootstrapCallbacks<C, P> = { [P]: ((C, BootstrapTelemetryContext) -> ())? }`.
+Missing/nil callbacks are skipped. A lookup must be narrowed before calling it. There is no
+requirement to implement every phase and no phase generic for `construct` or `destroy`.
+Every callback also receives `BootstrapTelemetryContext`.
 
 ```luau
-{
-    name = "Camera Service",
-    construct = function(graphContext, telemetryContext)
-        local task = telemetryContext:createTask("Prepare camera")
-        task:setStatus("Constructing camera")
-        local CameraService = require(script.Parent.cameraService)
-        graphContext.cameraService = CameraService.new()
-        task:complete()
+type StartPhase = "activate"
+type StopPhase = "quiesce"
+type Context = { count: number? }
+type Graph = { count: number }
+
+local profile: Bootstrap.BootstrapProfile<Context, Graph, StartPhase, StopPhase> = {
+    validate = function(context: Context): Graph
+        return { count = assert(context.count, "Count was not constructed") }
     end,
-    wire = function(graphContext)
-        graphContext.cameraService:wire(graphContext.playerService:getReader())
-    end,
-    deconstruct = function(graphContext)
-        local cameraService = graphContext.cameraService
-        graphContext.cameraService = nil
-        if cameraService then
-            cameraService:deconstruct()
-        end
-    end,
+    registrations = {{
+        name = "Counter",
+        construct = function(context: Context)
+            context.count = 1
+        end,
+        start = {
+            ["activate" :: StartPhase] = function(graph: Graph)
+                print(graph.count)
+            end,
+        },
+        stop = {
+            ["quiesce" :: StopPhase] = function(context: Context)
+                -- Tolerate a partial graph, including a throwing constructor.
+                print(context.count)
+            end,
+        },
+        destroy = function(context: Context)
+            context.count = nil
+        end,
+    }},
+    shutdown = {{
+        name = "Host shutdown work",
+        run = function(context: Context)
+            -- Attempt work using preinstalled capabilities or whatever was acquired.
+            -- This also runs with an empty context; do not construct unused services here.
+            print(context.count)
+        end,
+    }},
 }
+local options: Bootstrap.BootstrapOptions<StartPhase, StopPhase> = {
+    startPhases = { "activate" :: StartPhase },
+    stopPhases = { "quiesce" :: StopPhase },
+}
+local context: Context = {}
+local application = Bootstrap.new(profile, context, options)
+local graph = application:create()
+application:destroy()
 ```
 
-The snippet assumes application-owned services; the executable example is self-contained.
-Construction options belong to the profile factory and its callback closures. Bootstrap accepts
-the initial graph context, not a separate generic service-options object.
+The complete graph may be a different table containing the same acquired objects. Bootstrap passes
+that exact validated value to every start callback and returns it from `create`. Stop, destroy,
+and critical shutdown always receive the original context, including after validation fails.
+The composition owner sees the graph; services receive only injected capabilities. Keep implementation
+requires inside construct callbacks. There is no service locator or reflective discovery.
 
-The composition owner sees the graph. Services receive only the ports they need. There is no
-service locator, inferred dependency graph, reflective discovery, or type function. Client/server
-profiles choose different registrations. Keep implementation requires **inside `construct`**;
-requiring a profile should load only inert composition code and type leaves.
+## Ordering, ownership, and cancellation
 
-## Phase ordering and lifecycle
-
-For registrations A and B, the order is:
+`new` validates and copies phase arrays, registration callbacks/maps, and shutdown callback references
+without executing application callbacks. Subsequent declaration edits do not change the controller.
+Captured closure values and graph objects remain caller-owned references. Arrays must be dense,
+phase names nonblank strings and unique within each array, and owner names unique within their list.
+The same phase spelling may occur in both arrays. Supplied start/stop callbacks must belong to a
+declared phase. Both arrays, either map, and the registration array may be empty.
 
 ```text
-construct A -> construct B -> validate
-init A      -> init B
-wire A      -> wire B
-start A     -> start B
-running
-deconstruct B -> deconstruct A
+application:create():
+  construct A -> construct B -> validate
+  first start phase A -> first start phase B
+  next start phase A  -> next start phase B -> running
+
+application:destroy():
+  critical shutdown callbacks
+  first stop phase A -> first stop phase B
+  next stop phase A  -> next stop phase B
+  destroy B -> destroy A
 ```
 
-Missing optional callbacks are skipped. Each phase completes before the next begins.
-Callbacks execute sequentially on the caller's coroutine; yielding holds the phase barrier.
-Promises are not implicitly awaited. Await them inside the callback when needed, and never wait
-for a producer that only starts in a later phase.
+Constructors run in registration order. Start and stop each iterate their own supplied phase array,
+then the registration array in forward order. Dictionary iteration never schedules callbacks. Final
+destructors run in reverse registration order, after all eligible stop attempts. Stop failures do
+not skip later stop callbacks or destructors; destructor failures do not skip remaining destructors.
+Each callback returns before the next begins; Promises must be explicitly awaited inside callbacks.
 
-`new` captures and freezes registration callback references without running them. It retains
-the profile callbacks until shutdown for cleanup. Captured application options and graph objects
-remain caller-owned references.
+Entry into `construct` acquires cleanup ownership for that registration, even if it throws. Every
+stop callback and the final destructor of an entered owner gets one attempt, tolerating absent or
+partially initialized fields **even when no start callback ran**. Unentered owners receive neither
+stop nor destroy. Publish acquired resources into `C` as soon as cleanup can safely own them; a
+constructor that throws before publishing must release its own unpublished resources. Detached
+service work remains service-owned. The four sections do not add restart support: this controller
+still has one creation and one destruction operation.
 
-Each runner is single-use. `start` requires `idle`. Status moves through `constructing`,
-`validating`, `initializing`, `wiring`, `starting`, and `running`. Shutdown uses
-`deconstructing`, then `stopped` or `failed`. Empty optional phases have no telemetry operations.
-Deconstructing an idle runner prevents startup without constructing anything.
+Status is `idle`, `creating`, `running`, `destroying`, then `stopped` or `failed`.
+`create` is single-use; concurrent, repeated, or reentrant calls fail. `destroy` from another
+coroutine during creation sets a cancellation request and waits for that lifecycle owner. The active
+callback may finish, but no later constructor, validation, or start callback begins. Bootstrap also
+checks after its pre-callback pacing yield, before acquiring an owner. `checkpoint()` within a
+callback paces that callback; it does not unwind it. Cleanup starts only after the active creation
+callback returns or throws, so creation and destruction never mutate the owned graph concurrently.
 
-Reentrant lifecycle calls are rejected, including while callbacks are yielding and from telemetry
-observers. There is no detached worker, implicit cancellation, retry, restart, or timeout policy.
+Concurrent destruction callers join that one operation, including while critical work, stop, or
+destroy yields. Completion is single-shot. After successful destruction, repeated `destroy` calls
+return without work. After terminal failure, every joined or repeated `destroy` rethrows the same
+stored aggregate, with no retries. Cancellation alone produces `stopped`: `create` throws a
+cancellation error and joined `destroy` calls return successfully. Creation or cleanup exceptions
+produce `failed` and take precedence over the cancellation message.
+
+Calling `destroy` from the active callback's own coroutine is rejected before requesting shutdown,
+preventing a self-join deadlock. This applies to constructors, validation, start, stop, destroy, and
+critical shutdown callbacks. Telemetry observers cannot call lifecycle methods. Do not synchronously
+await a child coroutine that joins your own lifecycle operation; Bootstrap cannot detect arbitrary
+cycles in application waits.
+
+## Critical shutdown and limits
+
+Profile `shutdown` callbacks run first, in their explicit array order, before **any** ordinary stop
+or destroy callback. They run even from idle and after incomplete, cancelled, or failed creation.
+They are a generic mechanism for preinstalled critical work, including application-owned persistence
+attempts; Bootstrap has no storage or Roblox service knowledge. Each must tolerate partial context.
+If a persistence attempt needs quiescence, include that coordination in this ordered critical prefix;
+ordinary `stopPhases` have not run yet. Do not give two callbacks ownership of the same release.
+
+Prioritizing critical work prevents unrelated ordinary cleanup from trapping it behind a yield.
+It does not bypass an active creation callback or an earlier critical callback. All callbacks remain
+sequential to protect shared resources. A callback that never returns can prevent shutdown completion,
+and a nonreturning creation callback prevents even the critical prefix from starting. Schedule
+bounded, cooperative critical callbacks in priority order. Bootstrap does not forcibly terminate
+callbacks, impose timeouts, guarantee persistence, or extend an external host shutdown deadline.
+The host owns deadlines and any independently safe emergency persistence path. Killing the coroutine
+that owns creation/destruction also abandons its joiners; keep it alive until the operation settles.
 
 ## Pacing and long operations
 
@@ -137,6 +205,8 @@ Avoid heavy top-level module work and split genuinely expensive tasks into bound
 Yielding between phases alone cannot prevent one large constructor from timing out.
 
 Hosts/tests may inject `clock: () -> number` and `yieldExecution: () -> ()`.
+`yieldExecution` also parks destruction joiners: it must actually yield whenever another operation
+is active (a no-op is only suitable for synchronous tests). Join polling does not reset the owner's pacing budget.
 The clock must be monotonic and non-yielding; both scheduler functions must work without throwing.
 Pacing gives the scheduler opportunities to run; it does not enforce a hard frame-time limit.
 
@@ -151,11 +221,11 @@ Each registration callback receives a `BootstrapTelemetryContext` with three met
 The context is frozen. Its method fields are typed `read`, so callers can invoke them but cannot
 replace them. This does not make the tasks created through the context read-only.
 
-The host can also obtain `application:getTelemetryReader()` before calling `start`.
+The host can also obtain `application:getTelemetryReader()` before calling `create`.
 The context has no arbitrary metadata fields, snapshot setter, or combined change notification.
 
 ```luau
-wire = function(graph, telemetryContext)
+["wire" :: StartPhase] = function(graph, telemetryContext)
     local task = telemetryContext:createTask("Load weapon models")
     task:setStatus("Waiting for assets")
     task:setProgress(0, #models)
@@ -192,7 +262,7 @@ status/progress afterward fails. There is no reactivation or separate release op
 
 Task readers provide:
 
-- `getName()`, `getPhase()`, `getOperationName()` for immutable identity. Phase and the registration
+- `getName()`, `getPhase()`, `getOperationName()` for immutable identity. Phase and the operation
   label are captured from the creating operation.
 - `getStatus()`, `getProgress() -> (number?, number?)`, `getState()`, `getFailure()`.
 - `bindToStatusChanged(callback)`, `bindToProgressChanged(callback)`, and
@@ -246,10 +316,10 @@ The telemetry reader also exposes Bootstrap-owned information independently of t
 
 | Getter | Meaning |
 | --- | --- |
-| `getPhase()` | `idle`, `construct`, `validate`, `init`, `wire`, `start`, `deconstruct`, `ready`, `stopped`, or `failed`. |
+| `getPhase()` | Caller start/stop phase name, or lifecycle labels `idle`, `construct`, `validate`, `shutdown`, `destroy`, `ready`, `stopped`, `failed`. Use controller status to disambiguate a reused spelling. |
 | `getName()` | Current registration label; nil for graph validation and terminal phases. |
-| `getOperationState()` | `pending`, `running`, `completed`, or `failed`. |
-| `getOperationProgress()` | Completed/total callback counts, including startup validation. Shutdown counts entered registrations; stopped/failed reset counts to zero. This is not a time estimate. |
+| `getOperationState()` | `pending`, `running`, `completed`, `cancelled`, or `failed`. A callback skipped after a pacing yield reports `cancelled`. |
+| `getOperationProgress()` | Finished-attempt/total callback counts, including constructors and validation. Shutdown counts critical callbacks plus eligible stop callbacks and final destructors; stopped/failed reset counts to zero. This is not a time estimate. |
 | `getElapsedSeconds()` | Live elapsed operation time while running, held at completion; terminal phases reset it to zero. |
 | `getFailure()` | Current operation or terminal failure text, when present. |
 
@@ -263,42 +333,44 @@ They cannot mutate telemetry, checkpoint, or change Bootstrap's lifecycle during
 Enumeration callbacks obey the same rules. Shutdown publishes terminal lifecycle values and clears
 remaining listeners. Retained readers can read/replay those final values.
 
-Place the UI registration first. It subscribes through `telemetryContext:getReader()` during its
-constructor and remains available through later service loading; reverse shutdown releases it last.
+Place the UI registration first. It subscribes through `telemetryContext:getReader()` during
+construction; reverse final destruction keeps it alive through every stop phase and other owner cleanup.
 The package owns no GUI, ReplicatedFirst behavior, or engine shutdown hook. The client/server entry
 script connects those application-specific policies.
 
-## Cleanup and failure
+## Failure reporting and migration
 
-Every entered constructor gets one deconstruction attempt, including a constructor that throws.
-Registrations not reached do not get deconstructed. Deconstructors must tolerate missing fields
-and partially initialized or wired objects. Publish acquired objects into the construction graph
-as soon as cleanup can safely own them. An object constructor that throws before returning must
-release its own unpublished resources.
+A constructor, validation, or start exception stops later creation and automatically runs the critical
+prefix, eligible stop phases, and final destructors. Cleanup exceptions include phase/name and
+traceback; they are collected while remaining callbacks are attempted. The terminal error retains
+the creation cause and all shutdown failures. Failed cleanup is never silently retried. Graph
+references become invalid for live use once destruction begins; the consumer must coordinate its
+other users of those objects.
 
-A failure in construction, validation, initialization, wiring, or startup prevents later work
-and triggers reverse deconstruction. Cleanup errors do not skip remaining registrations. The
-eventual error includes phase/name context, the original traceback, and collected cleanup failures.
-Ordinary shutdown likewise reports failures after attempting every entered registration.
+The public types are `Bootstrap<G>`, `BootstrapOptions<StartPhase, StopPhase>`,
+`BootstrapProfile<C, G, StartPhase, StopPhase>`, `BootstrapRegistration<C, G, StartPhase, StopPhase>`,
+`BootstrapCallbacks<C, Phase>`, and `BootstrapShutdown<C>`. Existing telemetry context, reader, task,
+and task-reader capabilities remain. `BootstrapStatus` is lifecycle state; `BootstrapPhase` is an
+observational string because start/stop phase names belong to callers. `BootstrapOperationState`
+includes `cancelled` for an operation skipped at its pacing boundary.
 
-Shutdown is idempotent after completion/failure; failed cleanup is not retried. Returned graph
-references are no longer valid for live use after teardown. Each registration owns its resources;
-do not double-release a child already owned by another object. Long-running tasks and cancellation
-belong to the service that starts them.
+For the pending VMMO migration:
 
-## Public types
+- Replace controller `start`/`deconstruct` with `create`/`destroy`; there are no compatibility aliases.
+- Keep one registration `construct` callback. Move later initialization/wiring/activation into the
+  `start` map. Split coordinated shutdown into the `stop` map and final resource release into `destroy`.
+- Supply independent `StartPhase`/`StopPhase` types and explicit `startPhases`/`stopPhases` arrays.
+  Individual callbacks are optional; both maps are required and may be empty.
+- Validation automatically follows construction. There is no `validateAfter`, `prepare` map,
+  registration `create` map, `createPhases`, or `destroyPhases` in this API.
+- Audit partial-context handling in both stop and destroy, plus final reverse destruction order.
+  Install critical shutdown callbacks on the profile before `new`, and bind the host shutdown hook
+  after `new` but before `create`.
+- Update status observers and phase-dependent loading UI. Catch cancellation from `create` and
+  stored terminal failures from `destroy`, including repeated calls. Registration start/stop sections
+  do not expose reversible lifecycle methods on the controller.
 
-- `Bootstrap<G>`: start, status, telemetry reader, and deconstruction.
-- `BootstrapOptions`: pacing and scheduler options.
-- `BootstrapProfile<C, G>` and `BootstrapRegistration<C, G>`: named lifecycle composition.
-- `BootstrapTelemetryContext`, `BootstrapTelemetryReader`.
-- `BootstrapTelemetryTask`, `BootstrapTelemetryTaskReader`, `BootstrapTelemetryTaskState`.
-- `BootstrapStatus`, `BootstrapPhase`, `BootstrapOperationState`.
-
-`C` is the construction/cleanup graph; `G` is the validated graph. The telemetry key generic `K`,
-`BootstrapTelemetrySnapshot`, `getSnapshot`, aggregate `bindToChanged`, `onProgress` option, and
-context `setDetail`/`setField`/`setProgress` have been removed. Create an operation-owned task for
-status and progress instead. This is a breaking package rewrite; consumers are not migrated here.
+No consumer dependency, VMMO code, engine hook, or publication is changed by this package pass.
 
 ## Verification
 

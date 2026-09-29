@@ -34,266 +34,881 @@ local function rejects(callback, fragment)
 	expect(not ok and tostring(failure):find(fragment, 1, true), tostring(failure))
 	return tostring(failure)
 end
-local function new(registrations, graphContext, validate, options)
+local function new(registrations, graphContext, validate, options, shutdown)
+	options = table.clone(options or {})
+	options.startPhases = options.startPhases or { "init", "wire", "start" }
+	options.stopPhases = options.stopPhases or { "release" }
+	options.clock = options.clock or function()
+		return 0
+	end
 	return Bootstrap.new({
 		registrations = registrations,
 		validate = validate or function(graph)
 			return graph
 		end,
-	}, graphContext or {}, options or {
-		clock = function()
-			return 0
-		end,
-	})
+		shutdown = shutdown,
+	}, graphContext or {}, options)
 end
 local function registration(name)
-	return { name = name, construct = function() end, deconstruct = function() end }
+	return { name = name, construct = function() end, start = {}, stop = {}, destroy = function() end }
 end
 
-test("named registrations preserve global phase barriers and reverse cleanup", function()
+local function resume(thread)
+	local ok, marker = coroutine.resume(thread)
+	expect(ok, tostring(marker))
+	return marker
+end
+local function launch(callback)
+	local thread = coroutine.create(callback)
+	return thread, resume(thread)
+end
+local function cooperativeOptions()
+	return {
+		yieldExecution = function()
+			coroutine.yield("join")
+		end,
+	}
+end
+
+test("four sections preserve graph identity phase barriers and reverse final destruction", function()
 	local events, context, graph = {}, {}, {}
-	local application
-	local registrations = {}
+	local entries = {}
 	for _, name in { "A", "B" } do
-		local entry = registration(name)
-		for _, phase in { "construct", "init", "wire", "start", "deconstruct" } do
-			entry[phase] = function(value, telemetry)
-				expect(value == (if phase == "construct" or phase == "deconstruct" then context else graph))
-				local reader = telemetry:getReader()
-				expect(
-					reader:getName() == name and reader:getPhase() == phase and reader:getOperationState() == "running"
-				)
-				table.insert(events, phase .. name)
-				if phase == "construct" then
-					context[name] = name
-				end
-				if phase == "wire" then
-					expect(context.A and context.B)
-				end
-			end
-		end
-		table.insert(registrations, entry)
+		entries[#entries + 1] = {
+			name = name,
+			construct = function(value, telemetry)
+				expect(value == context and telemetry:getReader():getPhase() == "construct")
+				context[name] = true
+				table.insert(events, "construct" .. name)
+			end,
+			start = {
+				connect = function(value)
+					expect(value == graph)
+					table.insert(events, "connect" .. name)
+				end,
+				activate = function(value, telemetry)
+					expect(
+						value == graph and context.A and context.B and telemetry:getReader():getPhase() == "activate"
+					)
+					table.insert(events, "activate" .. name)
+				end,
+			},
+			stop = {
+				flush = function(value)
+					expect(value == context)
+					table.insert(events, "flush" .. name)
+				end,
+				detach = function()
+					table.insert(events, "detach" .. name)
+				end,
+			},
+			destroy = function(value, telemetry)
+				expect(value == context and telemetry:getReader():getPhase() == "destroy")
+				table.insert(events, "destroy" .. name)
+			end,
+		}
 	end
-	application = new(registrations, context, function(value)
+	local app = new(entries, context, function(value)
 		expect(value == context and context.A and context.B)
 		table.insert(events, "validate")
 		return graph
-	end)
-	expect(application:getStatus() == "idle" and #events == 0)
-	expect(application:start() == graph and application:getStatus() == "running")
-	local reader = application:getTelemetryReader()
-	local completed, total = reader:getOperationProgress()
-	expect(reader:getPhase() == "ready" and completed == 9 and total == 9)
-	application:deconstruct()
-	application:deconstruct()
+	end, { startPhases = { "connect", "activate" }, stopPhases = { "detach", "flush" } })
+	expect(#events == 0 and app:getStatus() == "idle")
+	expect(app:create() == graph and app:getStatus() == "running")
+	local completed, total = app:getTelemetryReader():getOperationProgress()
+	expect(completed == 7 and total == 7)
+	app:destroy()
+	app:destroy()
 	expect(
 		table.concat(events, ",")
-			== "constructA,constructB,validate,initA,initB,wireA,wireB,startA,startB,deconstructB,deconstructA"
+			== "constructA,constructB,validate,connectA,connectB,activateA,activateB,detachA,detachB,flushA,flushB,destroyB,destroyA"
 	)
-	expect(application:getStatus() == "stopped")
+	expect(app:getStatus() == "stopped")
+	rejects(function()
+		app:create()
+	end, "only create once")
 end)
 
-test("only semantic name construct and deconstruct are required per registration", function()
-	local app = new({ registration("Minimal") })
-	app:start()
-	expect(select(2, app:getTelemetryReader():getOperationProgress()) == 2)
-	app:deconstruct()
-	local empty = new({})
-	empty:start()
-	expect(select(2, empty:getTelemetryReader():getOperationProgress()) == 1)
-	empty:deconstruct()
-end)
-
-test("invalid registrations and budgets fail before construction", function()
-	for _, entry in
+test("invalid phase declarations and registration callbacks fail while inert", function()
+	local function build(options, mutate)
+		local entry = registration("Owner")
+		local profile = {
+			registrations = { entry },
+			validate = function(graph)
+				return graph
+			end,
+		}
+		if mutate then
+			mutate(profile, entry)
+		end
+		return Bootstrap.new(profile, {}, options or { startPhases = { "wire" }, stopPhases = { "release" } })
+	end
+	for _, options in
 		{
-			{ construct = function() end, deconstruct = function() end },
-			{ name = "  ", construct = function() end, deconstruct = function() end },
-			{ name = "Missing construct", deconstruct = function() end },
-			{ name = "Missing deconstruct", construct = function() end },
-			{ name = "Bad wire", construct = function() end, deconstruct = function() end, wire = 3 },
+			{ startPhases = { "wire", "wire" }, stopPhases = {} },
+			{ startPhases = {}, stopPhases = { "release", "release" } },
+			{ startPhases = { "wire", " " }, stopPhases = {} },
+			{ startPhases = { "wire", 3 }, stopPhases = {} },
+			{ startPhases = { [1] = "wire", [3] = "activate" }, stopPhases = {} },
+			{ startPhases = { [1] = "wire", extra = "activate" }, stopPhases = {} },
 		}
 	do
 		rejects(function()
-			new({ entry })
-		end, if entry.wire then "Invalid wire" else "Registration")
+			build(options)
+		end, "")
 	end
-	rejects(function()
-		new({ registration("Same"), registration("Same") })
-	end, "Duplicate")
+	for _, mutate in
+		{
+			function(_, entry)
+				entry.start.unknown = function() end
+			end,
+			function(_, entry)
+				entry.stop.unknown = function() end
+			end,
+			function(_, entry)
+				entry.start.wire = 3
+			end,
+			function(_, entry)
+				entry.stop.release = 3
+			end,
+			function(_, entry)
+				entry.construct = nil
+			end,
+			function(_, entry)
+				entry.destroy = nil
+			end,
+			function(_, entry)
+				entry.construct = {}
+			end,
+			function(_, entry)
+				entry.destroy = {}
+			end,
+			function(_, entry)
+				entry.start = nil
+			end,
+			function(_, entry)
+				entry.stop = nil
+			end,
+			function(profile)
+				profile.registrations[3] = registration("Hole")
+			end,
+			function(profile)
+				profile.registrations[2] = registration("Owner")
+			end,
+			function(profile)
+				profile.shutdown = { { name = "Bad", run = 3 } }
+			end,
+		}
+	do
+		rejects(function()
+			build(nil, mutate)
+		end, "")
+	end
 	for _, budget in { -1, math.huge, 0 / 0 } do
 		rejects(function()
-			new({}, {}, nil, { budgetSeconds = budget })
+			new({}, nil, nil, { budgetSeconds = budget })
 		end, "budget")
 	end
 end)
 
-test("deconstructing idle prevents startup without constructing", function()
-	local entry = registration("Unused")
+test("empty phase arrays and absent optional phase callbacks still construct validate and destroy", function()
+	local events = {}
+	local entry = registration("Owner")
 	entry.construct = function()
-		error("must not construct")
+		table.insert(events, "construct")
 	end
-	local app = new({ entry })
-	app:deconstruct()
-	app:deconstruct()
-	rejects(function()
-		app:start()
-	end, "only start once")
+	entry.destroy = function()
+		table.insert(events, "destroy")
+	end
+	entry.start.wire = nil
+	entry.stop.release = nil
+	local app = new({ entry }, nil, function(graph)
+		table.insert(events, "validate")
+		return graph
+	end, { startPhases = {}, stopPhases = {} })
+	app:create()
+	app:destroy()
+	expect(table.concat(events, ",") == "construct,validate,destroy")
+	local sparse = new({ entry }, nil, nil, { startPhases = { "wire", "activate" }, stopPhases = { "release" } })
+	sparse:create()
+	sparse:destroy()
 end)
 
-test("partially throwing construction cleans entered registrations only", function()
+test("partial creation failure cleans entered owners and preserves every failure", function()
 	local events, context = {}, {}
-	local registrations = {}
-	for _, name in { "A", "B", "C" } do
-		table.insert(registrations, {
-			name = name,
-			construct = function(graph)
-				graph[name] = name
-				table.insert(events, "+" .. name)
-				if name == "B" then
-					error("partial construction")
-				end
-			end,
-			deconstruct = function(graph)
-				expect(graph == context and graph[name] == name)
-				graph[name] = nil
-				table.insert(events, "-" .. name)
-			end,
-		})
+	local entries = {}
+	for _, name in { "A", "B", "Unused" } do
+		local entry = registration(name)
+		entry.construct = function(value)
+			value[name] = true
+			table.insert(events, "+" .. name)
+			if name == "B" then
+				error("creation cause")
+			end
+		end
+		entry.destroy = function(value)
+			expect(value == context and value[name])
+			value[name] = nil
+			table.insert(events, "-" .. name)
+			if name == "A" then
+				error("cleanup cause")
+			end
+		end
+		entries[#entries + 1] = entry
 	end
-	local app = new(registrations, context, function()
-		error("validation must not run")
-	end)
-	rejects(function()
-		app:start()
-	end, "partial construction")
-	expect(table.concat(events, ",") == "+A,+B,-B,-A" and next(context) == nil)
+	local app = new(
+		entries,
+		context,
+		function()
+			error("validation must not run")
+		end,
+		nil,
+		{
+			{
+				name = "Critical",
+				run = function(value)
+					expect(value == context)
+					table.insert(events, "critical")
+					error("critical cause")
+				end,
+			},
+			{
+				name = "Critical later",
+				run = function()
+					table.insert(events, "critical later")
+				end,
+			},
+		}
+	)
+	local failure = rejects(function()
+		app:create()
+	end, "creation cause")
+	expect(failure:find("cleanup cause", 1, true) and failure:find("critical cause", 1, true))
+	expect(table.concat(events, ",") == "+A,+B,critical,critical later,-B,-A" and next(context) == nil)
 	expect(app:getStatus() == "failed")
-	app:deconstruct()
+	expect(rejects(function()
+		app:destroy()
+	end, "creation cause") == failure)
+	expect(app:getTelemetryReader():getFailure() == failure)
 	rejects(function()
-		app:start()
-	end, "only start once")
+		app:create()
+	end, "only create once")
 end)
 
-for _, failingPhase in { "validate", "init", "wire", "start" } do
-	test("failure in " .. failingPhase .. " stops later work and reverses cleanup", function()
+for _, phase in { "validate", "init", "wire", "start" } do
+	test("failure at " .. phase .. " prevents later creation and cleans all entered owners", function()
 		local events = {}
-		local entries = {}
-		for _, name in { "A", "B" } do
-			local entry = registration(name)
-			for _, phase in { "construct", "init", "wire", "start", "deconstruct" } do
-				entry[phase] = function()
-					table.insert(events, phase .. name)
-					if phase == failingPhase and name == "A" then
-						error("deliberate " .. phase)
+		local entries = { registration("A"), registration("B") }
+		for _, entry in entries do
+			for _, name in { "init", "wire", "start" } do
+				entry.start[name] = function()
+					table.insert(events, name .. entry.name)
+					if name == phase then
+						error("failed " .. phase)
 					end
 				end
 			end
-			table.insert(entries, entry)
+			entry.destroy = function()
+				table.insert(events, "release" .. entry.name)
+			end
 		end
-		local app = new(entries, {}, function(graph)
-			table.insert(events, "validate")
-			if failingPhase == "validate" then
-				error("deliberate validate")
+		local app = new(entries, nil, function(graph)
+			if phase == "validate" then
+				error("failed validate")
 			end
 			return graph
 		end)
 		rejects(function()
-			app:start()
-		end, "deliberate " .. failingPhase)
-		local expected = "constructA,constructB,validate"
-		for _, phase in { "init", "wire", "start" } do
-			if failingPhase == "validate" then
-				break
-			end
-			expected ..= "," .. phase .. "A"
-			if phase == failingPhase then
-				break
-			end
-			expected ..= "," .. phase .. "B"
+			app:create()
+		end, "failed " .. phase)
+		expect(events[#events - 1] == "releaseB" and events[#events] == "releaseA")
+		if phase ~= "validate" then
+			expect(events[#events - 2] == phase .. "A")
 		end
-		expect(table.concat(events, ",") == expected .. ",deconstructB,deconstructA")
 	end)
 end
 
-test("missing graph assignment fails validation before wire", function()
-	local entry = registration("Missing")
-	entry.wire = function()
-		error("should not wire")
-	end
-	local app = new({ entry }, {}, function(graph)
-		return { service = assert(graph.service, "missing service") }
-	end)
-	rejects(function()
-		app:start()
-	end, "missing service")
-end)
-
-test("startup error retains cause and all cleanup failures", function()
-	local entries = { registration("A"), registration("B") }
+test("idle shutdown attempts critical work without constructing or cleaning unused owners", function()
 	local count = 0
-	for _, entry in entries do
-		local name = entry.name
-		entry.deconstruct = function()
+	local entry = registration("Unused")
+	entry.construct = function()
+		error("must not construct")
+	end
+	entry.destroy = function()
+		error("must not clean")
+	end
+	local app = new({ entry }, nil, nil, nil, { {
+		name = "Preinstalled",
+		run = function()
 			count += 1
-			error("cleanup " .. name)
-		end
-	end
-	entries[2].construct = function()
-		error("startup failed")
-	end
-	local app = new(entries)
-	local message = rejects(function()
-		app:start()
-	end, "startup failed")
-	expect(message:find("cleanup A", 1, true) and message:find("cleanup B", 1, true) and count == 2)
-	app:deconstruct()
-	expect(count == 2)
-end)
-
-test("normal shutdown continues after failure without retry", function()
-	local count = 0
-	local entries = { registration("Healthy"), registration("Broken") }
-	entries[1].deconstruct = function()
-		count += 1
-	end
-	entries[2].deconstruct = function()
-		count += 1
-		error("release failed")
-	end
-	local app = new(entries)
-	app:start()
+		end,
+	} })
+	app:destroy()
+	app:destroy()
+	expect(count == 1 and app:getStatus() == "stopped")
 	rejects(function()
-		app:deconstruct()
-	end, "release failed")
-	expect(count == 2 and app:getStatus() == "failed")
-	app:deconstruct()
-	expect(count == 2)
+		app:create()
+	end, "only create once")
 end)
 
-test("yielding callback holds barrier and rejects reentrant lifecycle", function()
-	local entry, wired = registration("Yield"), false
-	entry.init = function()
-		coroutine.yield("waiting")
+test("stop failure does not skip later owners phases or final destructors", function()
+	local events = {}
+	local a, b = registration("A"), registration("B")
+	a.stop.release = function()
+		table.insert(events, "failed stop")
+		error("stop failed")
 	end
-	entry.wire = function()
-		wired = true
+	b.stop.release = function()
+		table.insert(events, "later owner")
+	end
+	a.stop.finish = function()
+		table.insert(events, "later phase")
+	end
+	b.destroy = function()
+		table.insert(events, "failed destroy")
+		error("destroy failed")
+	end
+	a.destroy = function()
+		table.insert(events, "last destroy")
+	end
+	local app = new({ a, b }, nil, nil, { stopPhases = { "release", "finish" } })
+	app:create()
+	local failure = rejects(function()
+		app:destroy()
+	end, "stop failed")
+	expect(failure:find("destroy failed", 1, true))
+	expect(rejects(function()
+		app:destroy()
+	end, "stop failed") == failure)
+	expect(table.concat(events, ",") == "failed stop,later owner,later phase,failed destroy,last destroy")
+end)
+
+test("destruction during suspended creation cancels later callbacks and joins cleanup", function()
+	local entry, unused, events = registration("Active"), registration("Unused"), {}
+	entry.construct = function(context)
+		context.partial = true
+		table.insert(events, "entered")
+		coroutine.yield("creating")
+		expect(context.partial)
+		table.insert(events, "returned")
+	end
+	entry.start.wire = function()
+		error("must not wire")
+	end
+	unused.construct = function()
+		error("must not construct unused")
+	end
+	unused.destroy = function()
+		error("must not clean unused")
+	end
+	entry.destroy = function(context)
+		expect(context.partial)
+		context.partial = nil
+		table.insert(events, "cleanup")
+		coroutine.yield("cleaning")
+	end
+	local app = new(
+		{ entry, unused },
+		nil,
+		function()
+			error("must not validate")
+		end,
+		cooperativeOptions(),
+		{
+			{
+				name = "Critical",
+				run = function()
+					table.insert(events, "critical")
+				end,
+			},
+		}
+	)
+	local creator, marker = launch(function()
+		rejects(function()
+			app:create()
+		end, "creation cancelled")
+	end)
+	expect(marker == "creating")
+	local first, firstMarker = launch(function()
+		app:destroy()
+		table.insert(events, "joined1")
+	end)
+	local second, secondMarker = launch(function()
+		app:destroy()
+		table.insert(events, "joined2")
+	end)
+	expect(firstMarker == "join" and secondMarker == "join" and table.concat(events) == "entered")
+	expect(app:getStatus() == "creating")
+	rejects(function()
+		app:create()
+	end, "only create once")
+	expect(resume(creator) == "cleaning" and app:getStatus() == "destroying")
+	expect(table.concat(events, ",") == "entered,returned,critical,cleanup")
+	expect(resume(first) == "join" and resume(second) == "join")
+	resume(creator)
+	resume(first)
+	resume(second)
+	expect(
+		coroutine.status(creator) == "dead" and coroutine.status(first) == "dead" and coroutine.status(second) == "dead"
+	)
+	expect(app:getStatus() == "stopped")
+	app:destroy()
+	expect(table.concat(events, ",") == "entered,returned,critical,cleanup,joined1,joined2")
+end)
+
+test("multiple destruction requests join a suspended failing cleanup with identical outcomes", function()
+	local entry, count, failures = registration("Owner"), 0, {}
+	entry.destroy = function()
+		count += 1
+		coroutine.yield("cleaning")
+		error("shared failure")
+	end
+	local app = new({ entry }, nil, nil, cooperativeOptions())
+	app:create()
+	local function call()
+		local failure = rejects(function()
+			app:destroy()
+		end, "shared failure")
+		table.insert(failures, failure)
+	end
+	local owner, marker = launch(call)
+	local first, a = launch(call)
+	local second, b = launch(call)
+	expect(marker == "cleaning" and a == "join" and b == "join" and count == 1)
+	resume(owner)
+	resume(first)
+	resume(second)
+	expect(#failures == 3 and failures[1] == failures[2] and failures[2] == failures[3])
+	expect(rejects(function()
+		app:destroy()
+	end, "shared failure") == failures[1] and count == 1)
+end)
+
+test("critical shutdown finishes before unrelated yielding ordinary cleanup starts", function()
+	local entry, critical, done = registration("Yield cleanup"), false, false
+	entry.destroy = function()
+		expect(critical)
+		coroutine.yield("unrelated wait")
+	end
+	local app = new(
+		{ entry },
+		nil,
+		nil,
+		nil,
+		{ {
+			name = "Critical",
+			run = function()
+				critical = true
+			end,
+		} }
+	)
+	app:create()
+	local owner, marker = launch(function()
+		app:destroy()
+		done = true
+	end)
+	expect(marker == "unrelated wait" and critical and not done)
+	resume(owner)
+	expect(done)
+end)
+
+test("cancellation during pacing never enters or cleans the pending owner", function()
+	local entry, critical = registration("Pending"), 0
+	entry.construct = function()
+		error("must not enter")
+	end
+	entry.destroy = function()
+		error("must not clean")
+	end
+	local app = new({ entry }, nil, nil, {
+		budgetSeconds = 0,
+		yieldExecution = function()
+			coroutine.yield("paced")
+		end,
+	}, {
+		{
+			name = "Critical",
+			run = function()
+				critical += 1
+			end,
+		},
+	})
+	local creator = launch(function()
+		rejects(function()
+			app:create()
+		end, "creation cancelled")
+	end)
+	local destroyer = launch(function()
+		app:destroy()
+	end)
+	expect(resume(creator) == "paced") -- Critical work is paced too, after cancelled creation.
+	expect(critical == 0)
+	resume(creator)
+	resume(destroyer)
+	expect(critical == 1 and app:getStatus() == "stopped")
+end)
+
+test("reentrant calls fail explicitly from creation validation critical work and cleanup", function()
+	local app, count = nil, 0
+	local function reenter()
+		rejects(function()
+			app:create()
+		end, "only create once")
+		rejects(function()
+			app:destroy()
+		end, "Reentrant")
+		count += 1
+	end
+	local entry = registration("Reentrant")
+	entry.construct = reenter
+	entry.destroy = reenter
+	app = new({ entry }, nil, function(graph)
+		reenter()
+		return graph
+	end, nil, { { name = "Critical", run = reenter } })
+	app:create()
+	app:destroy()
+	expect(count == 4 and app:getStatus() == "stopped")
+end)
+
+test("default scheduler joins concurrent destruction across actual task waits", function()
+	local task = require("@lune/task")
+	local entry, calls, finished = registration("Scheduled"), 0, 0
+	entry.destroy = function()
+		calls += 1
+		task.wait()
+		task.wait()
 	end
 	local app = new({ entry })
-	local thread = coroutine.create(function()
-		app:start()
+	app:create()
+	task.spawn(function()
+		app:destroy()
+		finished += 1
 	end)
-	local ok, marker = coroutine.resume(thread)
-	expect(ok and marker == "waiting" and app:getStatus() == "initializing" and not wired)
+	app:destroy()
+	finished += 1
+	expect(calls == 1 and finished == 2 and app:getStatus() == "stopped")
+end)
+
+test("cancellation during suspended validation preserves partial context and stops activation", function()
+	local entry, critical = registration("Owner"), false
+	entry.construct = function(context)
+		context.acquired = true
+	end
+	entry.start.init = function()
+		error("must not activate")
+	end
+	entry.destroy = function(context)
+		expect(context.acquired and critical)
+		context.acquired = nil
+	end
+	local app = new(
+		{ entry },
+		nil,
+		function(context)
+			coroutine.yield("validation")
+			expect(context.acquired)
+			return { ready = true }
+		end,
+		cooperativeOptions(),
+		{
+			{
+				name = "Critical",
+				run = function(context)
+					expect(context.acquired)
+					critical = true
+				end,
+			},
+		}
+	)
+	local creator, marker = launch(function()
+		rejects(function()
+			app:create()
+		end, "creation cancelled")
+	end)
+	expect(marker == "validation")
+	local destroyer, joined = launch(function()
+		app:destroy()
+	end)
+	expect(joined == "join" and not critical)
+	resume(creator)
+	resume(destroyer)
+	expect(critical and app:getStatus() == "stopped")
+end)
+
+test("creation failure during cancellation is shared with destruction joiners", function()
+	local entry, failures, cleaned = registration("Owner"), {}, 0
+	entry.construct = function()
+		coroutine.yield("creation")
+		error("creation failed during cancellation")
+	end
+	entry.destroy = function()
+		cleaned += 1
+	end
+	local app = new({ entry }, nil, nil, cooperativeOptions())
+	local creator = launch(function()
+		local failure = rejects(function()
+			app:create()
+		end, "creation failed during cancellation")
+		table.insert(failures, failure)
+	end)
+	local destroyer = launch(function()
+		local failure = rejects(function()
+			app:destroy()
+		end, "creation failed during cancellation")
+		table.insert(failures, failure)
+	end)
+	resume(creator)
+	resume(destroyer)
+	expect(#failures == 2 and failures[1] == failures[2] and cleaned == 1 and app:getStatus() == "failed")
+end)
+
+test("idle critical shutdown may yield and concurrent requests join it once", function()
+	local count, joined = 0, 0
+	local app = new(
+		{},
+		nil,
+		nil,
+		cooperativeOptions(),
+		{ {
+			name = "Critical",
+			run = function()
+				count += 1
+				coroutine.yield("critical")
+			end,
+		} }
+	)
+	local owner, marker = launch(function()
+		app:destroy()
+		joined += 1
+	end)
+	local other, waiting = launch(function()
+		app:destroy()
+		joined += 1
+	end)
+	expect(marker == "critical" and waiting == "join" and count == 1 and joined == 0)
+	resume(owner)
+	resume(other)
+	expect(count == 1 and joined == 2)
+end)
+
+test("phase arrays maps and critical callbacks are captured independently of authored mutations", function()
+	local events, context = {}, {}
+	local entry = registration("Captured")
+	entry.construct = function(value)
+		expect(value == context)
+		table.insert(events, "create")
+	end
+	entry.destroy = function()
+		table.insert(events, "destroy")
+	end
+	local shutdown =
+		{ {
+			name = "Captured critical",
+			run = function()
+				table.insert(events, "critical")
+			end,
+		} }
+	entry.start.wire = function()
+		table.insert(events, "wire")
+	end
+	entry.stop.release = function()
+		table.insert(events, "stop")
+	end
+	local options = { startPhases = { "wire" }, stopPhases = { "release" } }
+	local app = new({ entry }, context, nil, options, shutdown)
+	entry.construct = function()
+		error("replacement construct")
+	end
+	entry.destroy = function()
+		error("replacement destroy")
+	end
+	table.clear(entry.start)
+	table.clear(entry.stop)
+	table.clear(options.startPhases)
+	table.clear(options.stopPhases)
+	shutdown[1].run = function()
+		error("replacement")
+	end
+	table.clear(shutdown)
+	app:create()
+	app:destroy()
+	expect(table.concat(events, ",") == "create,wire,critical,stop,destroy")
+end)
+
+test("an empty profile still validates and missing assignments fail before graph consumers", function()
+	local app = new({})
+	app:create()
+	app:destroy()
+	local entry = registration("Missing")
+	entry.start.wire = function()
+		error("must not wire")
+	end
+	app = new({ entry }, nil, function(context)
+		return { service = assert(context.service, "missing service") }
+	end)
 	rejects(function()
-		app:start()
-	end, "only start once")
+		app:create()
+	end, "missing service")
+	expect(app:getStatus() == "failed")
+end)
+
+test("destruction during suspended start stops later starts and releases every constructed owner", function()
+	local context, graph, events = {}, {}, {}
+	local a, b = registration("A"), registration("B")
+	a.construct = function(value)
+		value.a = true
+	end
+	b.construct = function(value)
+		value.b = true
+	end
+	a.start.init = function(value)
+		expect(value == graph)
+		table.insert(events, "start entered")
+		coroutine.yield("starting")
+		expect(context.a and context.b)
+		table.insert(events, "start returned")
+	end
+	b.start.init = function()
+		error("must not start B")
+	end
+	a.start.wire = function()
+		error("must not wire")
+	end
+	for _, entry in { a, b } do
+		entry.stop.release = function(value)
+			expect(value == context and value.a and value.b)
+			table.insert(events, "stop" .. entry.name)
+		end
+		entry.destroy = function()
+			table.insert(events, "destroy" .. entry.name)
+		end
+	end
+	local app = new(
+		{ a, b },
+		context,
+		function()
+			return graph
+		end,
+		cooperativeOptions(),
+		{ {
+			name = "Critical",
+			run = function()
+				table.insert(events, "critical")
+			end,
+		} }
+	)
+	local creator, marker = launch(function()
+		rejects(function()
+			app:create()
+		end, "creation cancelled")
+	end)
+	local destroyer, joined = launch(function()
+		app:destroy()
+	end)
+	expect(marker == "starting" and joined == "join" and table.concat(events) == "start entered")
+	resume(creator)
+	resume(destroyer)
+	expect(table.concat(events, ",") == "start entered,start returned,critical,stopA,stopB,destroyB,destroyA")
+	expect(app:getStatus() == "stopped")
+end)
+
+test("multiple destruction requests join suspended stop and wait for final destruction", function()
+	local entry, events, joined = registration("Owner"), {}, 0
+	entry.stop.release = function()
+		table.insert(events, "stop")
+		coroutine.yield("stopping")
+	end
+	entry.destroy = function()
+		table.insert(events, "destroy")
+		coroutine.yield("destroying")
+	end
+	local app = new({ entry }, nil, nil, cooperativeOptions())
+	app:create()
+	local owner, marker = launch(function()
+		app:destroy()
+		joined += 1
+	end)
+	local other, waiting = launch(function()
+		app:destroy()
+		joined += 1
+	end)
+	expect(marker == "stopping" and waiting == "join" and joined == 0 and #events == 1)
+	expect(resume(owner) == "destroying" and joined == 0)
+	expect(resume(other) == "join")
+	resume(owner)
+	resume(other)
+	app:destroy()
+	expect(table.concat(events, ",") == "stop,destroy" and joined == 2)
+end)
+
+test("stop handles partially constructed owners even when start never ran", function()
+	local context, events = {}, {}
+	local a, b, unused = registration("A"), registration("B"), registration("Unused")
+	a.construct = function(value)
+		value.a = true
+	end
+	b.construct = function(value)
+		value.partial = true
+		error("partial constructor")
+	end
+	for _, entry in { a, b } do
+		entry.start.init = function()
+			error("must not start")
+		end
+		entry.stop.release = function(value)
+			expect(value == context and value.a and value.partial)
+			table.insert(events, "stop" .. entry.name)
+		end
+		entry.destroy = function()
+			table.insert(events, "destroy" .. entry.name)
+		end
+	end
+	unused.stop.release = function()
+		error("must not stop unused")
+	end
+	unused.destroy = function()
+		error("must not destroy unused")
+	end
+	local app = new({ a, b, unused }, context)
 	rejects(function()
-		app:deconstruct()
-	end, "active lifecycle")
-	expect(coroutine.resume(thread))
-	expect(wired and app:getStatus() == "running")
-	app:deconstruct()
+		app:create()
+	end, "partial constructor")
+	expect(table.concat(events, ",") == "stopA,stopB,destroyB,destroyA")
+end)
+
+test("critical work precedes a suspended stop and reentrancy is rejected in start and stop", function()
+	local app, entry, critical, destroyed = nil, registration("Owner"), false, false
+	local function reenter()
+		rejects(function()
+			app:create()
+		end, "only create once")
+		rejects(function()
+			app:destroy()
+		end, "Reentrant")
+	end
+	entry.start.init = reenter
+	entry.stop.release = function()
+		expect(critical)
+		reenter()
+		coroutine.yield("stop wait")
+	end
+	entry.destroy = function()
+		destroyed = true
+	end
+	app = new({ entry }, nil, nil, nil, { {
+		name = "Critical",
+		run = function()
+			critical = true
+		end,
+	} })
+	app:create()
+	local owner, marker = launch(function()
+		app:destroy()
+	end)
+	expect(marker == "stop wait" and critical and not destroyed)
+	resume(owner)
+	expect(destroyed)
 end)
 
 test("time budget paces operations and explicit checkpoints including shutdown", function()
@@ -313,10 +928,10 @@ test("time budget paces operations and explicit checkpoints including shutdown",
 		expect(yields == 2)
 		table.insert(events, "B")
 	end
-	entries[2].deconstruct = function()
+	entries[2].destroy = function()
 		time += 0.005
 	end
-	entries[1].deconstruct = function()
+	entries[1].destroy = function()
 		expect(yields == 3)
 	end
 	local app = new(entries, {}, nil, {
@@ -329,10 +944,10 @@ test("time budget paces operations and explicit checkpoints including shutdown",
 			time += 10
 		end,
 	})
-	app:start()
+	app:create()
 	expect(yields == 2 and table.concat(events) == "AB")
 	time += 100
-	app:deconstruct()
+	app:destroy()
 	expect(yields == 3)
 end)
 
@@ -349,15 +964,15 @@ test("zero budget yields before each operation while publishing current label", 
 			table.insert(states, reader:getPhase() .. ":" .. (reader:getName() or "graph"))
 		end,
 	})
-	app:start()
-	app:deconstruct()
-	expect(table.concat(states, ",") == "construct:One,validate:graph,deconstruct:One")
+	app:create()
+	app:destroy()
+	expect(table.concat(states, ",") == "construct:One,validate:graph,destroy:One")
 end)
 
 test("default scheduler supports the real Lune task wait boundary", function()
 	local app = new({ registration("Default yield") }, {}, nil, { budgetSeconds = 0 })
-	app:start()
-	app:deconstruct()
+	app:create()
+	app:destroy()
 	expect(app:getStatus() == "stopped")
 end)
 
@@ -398,7 +1013,7 @@ test("tasks mutate in place and notify each property independently", function()
 			task:cancel()
 		end, "finished")
 	end
-	entry.init = function(_, context)
+	entry.start.init = function(_, context)
 		expect(context:getReader():getTaskCount() == 0)
 		rejects(function()
 			retainedContext:createTask("stale")
@@ -429,21 +1044,21 @@ test("tasks mutate in place and notify each property independently", function()
 			table.insert(outcomes, state)
 		end)
 	end)
-	app:start()
+	app:create()
 	expect(retainedContext:getReader() == reader)
 	local terminalReplay
 	retainedTask:getReader():bindToStateChanged(function(state)
 		terminalReplay = state
 	end)
 	expect(terminalReplay == "completed")
-	app:deconstruct()
+	app:destroy()
 end)
 
 test("active tasks preserve creation order and focus survives out of order completion", function()
 	local entry = registration("Tasks")
 	local focuses, removed, added = {}, {}, {}
 	local app
-	entry.wire = function(_, context)
+	entry.start.wire = function(_, context)
 		local reader = context:getReader()
 		local first = context:createTask("First")
 		local middle = context:createTask("Middle")
@@ -476,11 +1091,11 @@ test("active tasks preserve creation order and focus survives out of order compl
 		expect(task:getState() == "completed")
 		table.insert(removed, task:getName())
 	end)
-	app:start()
+	app:create()
 	expect(table.concat(added, ",") == "First,Middle,Last")
 	expect(table.concat(removed, ",") == "Middle,Last,First")
 	expect(table.concat(focuses, ",") == "none,First,Middle,Last,First,none")
-	app:deconstruct()
+	app:destroy()
 end)
 
 test("task validation rejects invalid inputs before publishing changes", function()
@@ -505,44 +1120,48 @@ test("task validation rejects invalid inputs before publishing changes", functio
 		task:cancel()
 	end
 	local app = new({ entry })
-	app:start()
-	app:deconstruct()
+	app:create()
+	app:destroy()
 end)
 
-test("callback exit cancels unfinished tasks in every phase including shutdown", function()
+test("callback exit cancels unfinished tasks in all four sections", function()
 	local entry, tasks = registration("Scoped"), {}
-	for _, phase in { "construct", "init", "wire", "start", "deconstruct" } do
-		entry[phase] = function(_, context)
-			expect(context:getReader():getTaskCount() == 0)
-			local task = context:createTask(phase)
-			table.insert(tasks, task)
-		end
+	local function callback(_, context)
+		expect(context:getReader():getTaskCount() == 0)
+		table.insert(tasks, context:createTask(context:getReader():getPhase()))
 	end
+	entry.construct, entry.destroy = callback, callback
+	entry.start.init, entry.start.wire, entry.start.start = callback, callback, callback
+	entry.stop.release = callback
 	local app = new({ entry })
-	app:start()
+	app:create()
+	expect(#tasks == 4)
 	for _, task in tasks do
 		expect(task:getReader():getState() == "cancelled")
 		rejects(function()
 			task:setProgress(1, 1)
 		end, "finished")
 	end
-	app:deconstruct()
-	expect(#tasks == 5 and tasks[5]:getReader():getState() == "cancelled")
+	app:destroy()
+	expect(#tasks == 6)
+	for _, task in tasks do
+		expect(task:getReader():getState() == "cancelled")
+	end
 	expect(app:getTelemetryReader():getTaskCount() == 0)
 end)
 
 test("throwing callback cancels its tasks before rollback begins", function()
 	local entry, task, checked = registration("Failure"), nil, false
-	entry.init = function(_, context)
+	entry.start.init = function(_, context)
 		task = context:createTask("Pending")
 		error("callback failure")
 	end
-	entry.deconstruct = function(_, context)
+	entry.destroy = function(_, context)
 		checked = task:getReader():getState() == "cancelled" and context:getReader():getTaskCount() == 0
 	end
 	local app = new({ entry })
 	rejects(function()
-		app:start()
+		app:create()
 	end, "callback failure")
 	expect(checked and app:getTelemetryReader():getFailure():find("callback failure", 1, true))
 end)
@@ -566,9 +1185,9 @@ test("failed task reports outcome without changing bootstrap control flow", func
 		expect(reader:getFailure() == "Asset unavailable")
 	end
 	local app = new({ entry })
-	app:start()
+	app:create()
 	expect(app:getStatus() == "running" and table.concat(events, ",") == "outcome,removed")
-	app:deconstruct()
+	app:destroy()
 end)
 
 test("observers may bind readers but cannot mutate tasks or reenter lifecycle", function()
@@ -588,10 +1207,10 @@ test("observers may bind readers but cannot mutate tasks or reenter lifecycle", 
 				context:checkpoint()
 			end, "observers")
 			rejects(function()
-				app:deconstruct()
+				app:destroy()
 			end, "observers")
 			rejects(function()
-				app:start()
+				app:create()
 			end, "observers")
 			checked = true
 		end)
@@ -617,8 +1236,8 @@ test("observers may bind readers but cannot mutate tasks or reenter lifecycle", 
 		task:complete()
 	end
 	app = new({ entry })
-	app:start()
-	app:deconstruct()
+	app:create()
+	app:destroy()
 end)
 
 test("subscribing during terminal replay does not skip existing outcome observers", function()
@@ -644,31 +1263,31 @@ test("subscribing during terminal replay does not skip existing outcome observer
 		task:complete()
 	end
 	app = new({ entry })
-	app:start()
+	app:create()
 	expect(table.concat(events, ",") == "first,replay,second")
-	app:deconstruct()
+	app:destroy()
 end)
 
 test("lifecycle observers cannot start or stop through immediate replay", function()
 	local app = new({ registration("Replay") })
 	for _, started in { false, true } do
 		if started then
-			app:start()
+			app:create()
 		end
 		local verified = false
 		local disconnect = app:getTelemetryReader():bindToPhaseChanged(function()
 			rejects(function()
-				app:start()
+				app:create()
 			end, "observers")
 			rejects(function()
-				app:deconstruct()
+				app:destroy()
 			end, "observers")
 			verified = true
 		end)
 		expect(verified)
 		disconnect()
 	end
-	app:deconstruct()
+	app:destroy()
 end)
 
 test("lifecycle properties are committed together before independent notifications", function()
@@ -687,10 +1306,10 @@ test("lifecycle properties are committed together before independent notificatio
 		end
 	end)
 	expect(count == 1)
-	app:start()
+	app:create()
 	expect(valid and count == 4)
 	stop()
-	app:deconstruct()
+	app:destroy()
 	expect(count == 4)
 	local final
 	reader:bindToPhaseChanged(function(phase)
@@ -718,9 +1337,9 @@ test("elapsed time reads live during operation and stops when callback ends", fu
 			elapsed = app:getTelemetryReader():getElapsedSeconds()
 		end
 	end)
-	app:start()
+	app:create()
 	expect(elapsed == 3)
-	app:deconstruct()
+	app:destroy()
 end)
 
 test("profile registration callbacks are captured at construction", function()
@@ -735,6 +1354,8 @@ test("profile registration callbacks are captured at construction", function()
 		end,
 	}
 	local app = Bootstrap.new(profile, {}, {
+		startPhases = { "init", "wire", "start" },
+		stopPhases = { "release" },
 		clock = function()
 			return 0
 		end,
@@ -742,15 +1363,15 @@ test("profile registration callbacks are captured at construction", function()
 	entry.construct = function()
 		error("replacement")
 	end
-	entry.deconstruct = function()
+	entry.destroy = function()
 		error("replacement cleanup")
 	end
 	table.clear(profile.registrations)
 	profile.validate = function()
 		error("replacement validation")
 	end
-	app:start()
-	app:deconstruct()
+	app:create()
+	app:destroy()
 	expect(count == 1)
 end)
 
@@ -761,16 +1382,16 @@ test("instances do not share graph or telemetry state", function()
 		local task = telemetry:createTask("Independent task")
 		task:setStatus(tostring(graph.value))
 	end
-	entry.deconstruct = function(graph)
+	entry.destroy = function(graph)
 		graph.live = false
 	end
 	local first = new({ entry }, { value = 1 })
 	local second = new({ entry }, { value = 2 })
-	local a, b = first:start(), second:start()
-	first:deconstruct()
+	local a, b = first:create(), second:create()
+	first:destroy()
 	expect(a ~= b and not a.live and b.live and b.value == 2)
 	expect(first:getTelemetryReader() ~= second:getTelemetryReader())
-	second:deconstruct()
+	second:destroy()
 end)
 
 test("actual example loads services lazily and keeps loading display until last cleanup", function()
@@ -789,11 +1410,16 @@ test("actual example loads services lazily and keeps loading display until last 
 		end,
 	})
 	local context = {}
-	local app = new(profile.registrations, context, profile.validate)
+	local app = new(
+		profile.registrations,
+		context,
+		profile.validate,
+		{ startPhases = { "init", "wire", "activate" }, stopPhases = { "quiesce", "persist" } }
+	)
 	for path in loaded do
 		expect(not path:find("^examples/components/"), path .. " loaded eagerly")
 	end
-	local graph = app:start()
+	local graph = app:create()
 	expect(loaded["examples/components/sample/shared/sampleCounter.luau"])
 	expect(loaded["examples/components/sample/shared/sampleReporter.luau"])
 	expect(loaded["examples/components/sample/shared/sampleLoadingDisplay.luau"])
@@ -803,10 +1429,10 @@ test("actual example loads services lazily and keeps loading display until last 
 	expect(table.find(displayed, "construct: Counter / Prepare counter: Creating initial value (1/1)"))
 	graph.sampleCounter:increment()
 	expect(graph.sampleCounter:get() == 42)
-	app:deconstruct()
+	app:destroy()
 	expect(next(context) == nil)
 	local last = displayed[#displayed]
-	expect(last == "deconstruct: Loading Display")
+	expect(last == "destroy: Loading Display")
 	rejects(function()
 		graph.sampleCounter:get()
 	end, "deconstructed")

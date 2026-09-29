@@ -6,6 +6,8 @@ local SampleLoadingDisplayTypes =
 type SampleCounter = SampleCounterTypes.SampleCounter
 type SampleReporter = SampleReporterTypes.SampleReporter
 type SampleLoadingDisplay = SampleLoadingDisplayTypes.SampleLoadingDisplay
+export type SampleStartPhase = "init" | "wire" | "activate"
+export type SampleStopPhase = "quiesce" | "persist"
 export type SampleOptions = {
 	initialValue: number,
 	report: (value: number) -> (),

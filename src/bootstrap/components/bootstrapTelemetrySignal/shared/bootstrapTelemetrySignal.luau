@@ -1,4 +1,6 @@
 --!strict
+--!optimize 2
+--!native
 local SignalTypes = require(
 	script.Parent.Parent.Parent.Parent.types.components.bootstrapTelemetrySignal.shared.bootstrapTelemetrySignal
 )

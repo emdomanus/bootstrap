@@ -1,4 +1,6 @@
 --!strict
+--!optimize 2
+--!native
 local TelemetryTypes =
 	require(script.Parent.Parent.Parent.Parent.types.components.bootstrapTelemetry.shared.bootstrapTelemetry)
 local ContextTypes = require(

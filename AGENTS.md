@@ -6,10 +6,16 @@
   `src/bootstrap/<category>/<owner>/shared/...`. Keep the runner independent of Roblox services.
 - Profiles own typed composition and service selection. Do not add reflective service discovery,
   string-keyed resolution, implicit Promise awaiting, or game-specific readiness exceptions.
-- Profile construction stays inert until `start`; errors stop subsequent phases and entered deconstructors all run.
-- Preserve single-use lifecycle, phase barriers, reverse cleanup, and the identity of the validated graph.
-- Registrations require semantic `name`, `construct`, and `deconstruct`; `init`, `wire`, and `start` are optional.
-  Do not add field-name metadata. Construction assigns the typed partial graph; validation returns its complete view.
+- Controller construction stays inert until `create`. Start and stop have independent typed phase arrays.
+- Preserve single-use lifecycle, phase barriers, validated-graph identity, and joined destruction ownership.
+  Cancellation stops subsequent creation callbacks at return/pacing boundaries; cleanup never overlaps creation.
+- Registrations require a semantic `name`, single `construct`/`destroy` callbacks, and `start`/`stop` maps.
+  Phase-map values are optional; maps may be empty. Validation runs between construction and start.
+  Constructors run forward; start/stop use their declared phase arrays with forward registration order;
+  final destructors run in reverse registration order after all stop attempts.
+  Ordinary stop/destroy visits entered constructors, even if start never ran. Preinstalled `shutdown`
+  work always runs first, including from idle. Cleanup exceptions accumulate without skipping subsequent
+  callbacks; terminal failures are replayed, not retried. Start/stop sections do not add restart support.
 - Keep implementation requires inside construct callbacks. Bootstrap owns telemetry and automatic pacing;
   profile callbacks can checkpoint long work. Keep observers synchronous and isolate their failures.
 - Use the pinned Rokit tools through `scripts/verify`, `scripts/lint`, and `scripts/build`.
